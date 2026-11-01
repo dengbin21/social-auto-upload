@@ -469,33 +469,30 @@ class BaiJiaHaoVideo(BaseVideoUploader):
             await page.wait_for_timeout(3000)
 
             # 弹窗内点选「含AI生成内容」
-            ai_option = page.locator('.cheetah-modal-wrap :text("含AI生成内容")').first
-            if not await ai_option.count():
-                ai_option = page.locator('text="含AI生成内容"').first
+            ai_option = page.locator('.cheetah-modal-content').get_by_text(
+                "含AI生成内容", exact=True
+            ).first
             await ai_option.wait_for(state="visible", timeout=10000)
-            await ai_option.click(timeout=5000)
+            await ai_option.click(timeout=5000, force=True)
             await page.wait_for_timeout(1000)
 
-            # 点「确定」按钮关闭弹窗（弹窗可能在点选后仍存在）
-            modal = page.locator('.cheetah-modal-wrap:visible').first
-            if await modal.count():
-                confirm_btn = modal.locator('button:has-text("确定")').first
-                if await confirm_btn.count() and await confirm_btn.is_visible():
-                    await confirm_btn.click(timeout=5000)
-                    await page.wait_for_timeout(500)
-                else:
-                    # 确定按钮不可见，尝试 force click 或按 Escape 关闭
-                    await page.keyboard.press("Escape")
-                    await page.wait_for_timeout(500)
+            # 点「确定」保存选择。不能按 Escape —— Escape 会关掉整个弹窗，
+            # 已点选的声明随之丢弃，发布时报「请选择创作声明类型」。
+            # 弹窗根节点是 .cheetah-modal-content，其外层 .cheetah-modal-wrap 可能不可见，
+            # 不能用 :visible 过滤后再找按钮。
+            confirm_btn = page.locator('.cheetah-modal-content button:has-text("确定")').first
+            await confirm_btn.wait_for(state="visible", timeout=8000)
+            await confirm_btn.click(timeout=8000, force=True)
+            await page.wait_for_timeout(1500)
 
-            baijiahao_logger.success(_msg("🏷️", "已选择「含AI生成内容」"))
+            # 回读确认选择已落到表单
+            if await page.locator('.cheetah-modal-content').count():
+                raise RuntimeError("创作声明弹窗未关闭")
+            value = await trigger.input_value()
+            if not value.strip():
+                raise RuntimeError("创作声明未写入表单")
+            baijiahao_logger.success(_msg("🏷️", f"已选择创作声明: {value}"))
         except Exception as exc:
-            # 如果失败，尝试关闭可能残留的弹窗
-            try:
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(500)
-            except Exception:
-                pass
             baijiahao_logger.warning(_msg("⚠️", f"选择 AI 声明失败: {exc}"))
 
     async def _apply_collection(self, page: Page) -> None:
@@ -568,22 +565,47 @@ class BaiJiaHaoVideo(BaseVideoUploader):
         await publish_btn.click(force=True)
         baijiahao_logger.info(_msg("🏃", "已点击发布按钮"))
 
-        # 等待跳转或成功提示（最多30s）
+        # 等待跳转或成功提示；出现安全验证时转为人工等待，故上限放宽到 360s
         start = time.monotonic()
-        while time.monotonic() - start < 30:
+        human_wait_started = 0.0
+        last_retry = time.monotonic()
+        retry_count = 0
+        while time.monotonic() - start < 360:
             url = page.url
             # 发布成功跳转
             if BAIJIAHAO_SUCCESS_URL_PREFIX in url or "/rc/content" in url or "/rc/home" in url:
                 baijiahao_logger.success(_msg("🥳", "视频发布成功"))
                 return
-            # 检查是否出现百度安全验证
+            # 检查是否出现百度安全验证：滑块无法自动完成，停在窗口内等人工处理
             if await page.locator('text="百度安全验证"').count():
-                raise RuntimeError("出现百度安全验证，需人工处理")
-            # 检查是否有错误提示阻止发布
+                if not human_wait_started:
+                    human_wait_started = time.monotonic()
+                    baijiahao_logger.warning(
+                        _msg("⚠️", "出现百度安全验证，请在浏览器窗口中手动完成（最多等待 300 秒）")
+                    )
+                if time.monotonic() - human_wait_started > 300:
+                    raise RuntimeError("百度安全验证 300 秒内未完成，需人工处理")
+                await page.wait_for_timeout(2000)
+                continue
+            # 检查是否有错误提示阻止发布；若提示视频未就绪，等一会儿重新点发布
+            # （上传到 100% 不等于转码完成，百度会以"确保视频已经上传完毕"拒绝，
+            #  此时页面状态会自己变好，只点一次就等到超时等于白等）
             error_toast = page.locator('.cheetah-message-error, .cheetah-message-warning').first
             if await error_toast.count() and await error_toast.is_visible():
                 err_text = await error_toast.inner_text()
-                baijiahao_logger.warning(_msg("⚠️", f"发布提示: {err_text}"))
+                if "上传完毕" in err_text or "上传" in err_text:
+                    if time.monotonic() - last_retry >= 15:
+                        last_retry = time.monotonic()
+                        retry_count += 1
+                        baijiahao_logger.info(
+                            _msg("🔁", f"视频仍在转码，等待后重试发布（{retry_count}）")
+                        )
+                        try:
+                            await publish_btn.click(force=True)
+                        except Exception:
+                            pass
+                else:
+                    baijiahao_logger.warning(_msg("⚠️", f"发布提示: {err_text}"))
             await page.wait_for_timeout(1000)
 
         # 超时后再检查一次

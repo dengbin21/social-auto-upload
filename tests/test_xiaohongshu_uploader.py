@@ -19,6 +19,10 @@ class FakeLocator:
     def first(self):
         return self
 
+    @property
+    def last(self):
+        return self
+
     def locator(self, selector):
         return self._children.get(selector, FakeLocator(selector))
 
@@ -45,7 +49,7 @@ class FakeLocator:
     async def fill(self, value):
         return None
 
-    async def click(self):
+    async def click(self, **kwargs):
         return None
 
 
@@ -68,8 +72,8 @@ class RecordingLocator(FakeLocator):
     async def fill(self, value):
         self.actions.append(("fill", value))
 
-    async def click(self):
-        self.actions.append(("click",))
+    async def click(self, **kwargs):
+        self.actions.append(("click", kwargs) if kwargs else ("click",))
 
     async def wait_for(self, **kwargs):
         self.actions.append(("wait_for", kwargs))
@@ -87,6 +91,60 @@ class RecordingPage:
 
     def locator(self, selector):
         return self.locators[selector]
+
+
+class UntouchablePage:
+    """记录被访问过的页面方法，用来断言声明流程是否触碰了 DOM。"""
+
+    def __init__(self):
+        self.touches = []
+
+    def _touch(self, name):
+        self.touches.append(name)
+        return FakeLocator(name)
+
+    def get_by_text(self, text, exact=False):
+        return self._touch("get_by_text")
+
+    def get_by_role(self, role, name=None):
+        return self._touch("get_by_role")
+
+    def get_by_placeholder(self, text):
+        return self._touch("get_by_placeholder")
+
+    def locator(self, selector):
+        return self._touch("locator")
+
+
+class DeclarationPage:
+    """最小化模拟「来源转载」声明的完整成功链路。"""
+
+    def __init__(self):
+        self.actions = []
+        self.keyboard = RecordingKeyboard()
+        self.trigger = RecordingLocator("trigger")
+        self.repost_option = RecordingLocator("repost_option")
+        self.source_input = RecordingLocator("source_input")
+        self.confirm = RecordingLocator("confirm")
+
+    async def wait_for_timeout(self, ms):
+        self.actions.append(("wait", ms))
+
+    def get_by_text(self, text, exact=False):
+        self.actions.append(("get_by_text", text, exact))
+        return self.trigger
+
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return self.repost_option
+
+    def get_by_placeholder(self, text):
+        self.actions.append(("get_by_placeholder", text))
+        return self.source_input
+
+    def get_by_role(self, role, name=None):
+        self.actions.append(("get_by_role", role, name))
+        return self.confirm
 
 
 class XiaohongshuUploaderTests(unittest.TestCase):
@@ -264,6 +322,54 @@ class XiaohongshuUploaderTests(unittest.TestCase):
         )
         self.assertNotIn(("type", "", None), page.keyboard.actions)
         self.assertIn(("type", "#话题1", 30), page.keyboard.actions)
+
+    def test_original_declaration_skips_dom_when_no_repost_source(self):
+        """未指定转载来源的原创笔记不得声明「来源转载」。"""
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        page = UntouchablePage()
+
+        asyncio.run(app.check_original_declaration(page))
+
+        self.assertEqual(page.touches, [])
+
+    def test_original_declaration_skips_dom_when_repost_source_is_blank(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        app.repost_source = ""
+        page = UntouchablePage()
+
+        asyncio.run(app.check_original_declaration(page))
+
+        self.assertEqual(page.touches, [])
+
+    def test_original_declaration_runs_when_repost_source_is_set(self):
+        """显式给了转载来源时才进入声明流程。"""
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        app.repost_source = "某某媒体"
+        page = DeclarationPage()
+
+        asyncio.run(app.check_original_declaration(page))
+
+        self.assertIn(("get_by_text", "添加内容类型声明", False), page.actions)
+        self.assertIn(("fill", "某某媒体"), page.source_input.actions)
+        self.assertIn(("click",), page.confirm.actions)
 
     def test_note_title_defaults_do_not_override_explicit_title(self):
         app = xhs_main.XiaoHongShuNote(

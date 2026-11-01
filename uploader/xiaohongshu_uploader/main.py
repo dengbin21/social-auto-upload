@@ -475,6 +475,11 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         容错：任一步失败记 warning 跳过、继续发布，不中断。
         """
         source = getattr(self, "repost_source", "") or ""
+        if not source:
+            # 未提供转载来源即为原创，不能声明「来源转载」：既会污染原创权重，
+            # 也会产生媒体名称为空的无效声明。直接跳过。
+            xiaohongshu_logger.info(_msg("🧾", "未指定转载来源，按原创发布，跳过来源声明"))
+            return
         try:
             # 1. 点「添加内容类型声明」
             trigger = page.get_by_text("添加内容类型声明", exact=False).first

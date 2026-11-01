@@ -339,46 +339,70 @@ class AlipayVideo(BaseVideoUploader):
         await desc_field.fill(self.desc)
         alipay_logger.info(_msg("🏷️", f"作品描述已填写: {self.desc[:40]}"))
 
+    async def dismiss_ai_optimize_popover(self, page: Page) -> None:
+        """关闭「开启AI智能优化」引导浮层。
+
+        视频上传完成后支付宝会弹出 `.ai-optimization-guide-popover`，浮层盖住
+        「上传封面」入口，点击会被 `<html>` 拦截并一直重试到超时。浮层里的
+        「暂不体验」是唯一不改变作品设置的关闭方式。
+        """
+        for _ in range(3):
+            popover = page.locator(".ai-optimization-guide-popover:visible").first
+            if not await popover.count():
+                return
+            try:
+                skip = popover.get_by_text("暂不体验", exact=True).first
+                await skip.scroll_into_view_if_needed(timeout=5000)
+                await skip.click(timeout=5000)
+                await page.wait_for_timeout(1200)
+            except Exception as exc:
+                alipay_logger.warning(_msg("😵", f"关闭 AI 优化浮层失败: {exc}"))
+                await page.wait_for_timeout(800)
+        if await page.locator(".ai-optimization-guide-popover:visible").count():
+            alipay_logger.warning(_msg("😵", "AI 优化浮层仍存在，封面可能无法上传"))
+
     async def upload_thumbnail(self, page: Page) -> None:
         if not self.thumbnail_path:
             return
         try:
-            # 1) 点发布表单的"上传封面"入口，弹出"截取封面"弹窗
+            # 1) 点发布表单的"上传封面"入口，弹出「截取封面 / 上传封面」弹窗
             cover_el = page.get_by_text("上传封面", exact=True).first
             await cover_el.scroll_into_view_if_needed()
-            await cover_el.click(timeout=10000)
+            await cover_el.click(timeout=15000)
             await page.wait_for_timeout(2000)
 
-            modal_body = page.locator(".antd5-modal-body").last
+            # 2) 弹窗是两个 tab：默认「截取封面」，切到「上传封面」
+            tab = page.locator(".antd5-modal-body .antd5-tabs-tab").filter(
+                has_text="上传封面"
+            ).first
+            await tab.wait_for(state="visible", timeout=10000)
+            await tab.click(timeout=8000)
+            await page.wait_for_timeout(2000)
 
-            # 2) 弹窗首次是"截取封面/上传封面"两入口；点"上传封面"展开图片上传区
-            inner = modal_body.get_by_text("上传封面", exact=True).first
-            if await inner.count():
-                await inner.click(timeout=8000)
-                await page.wait_for_timeout(1500)
-
-            # 3) 点"上传图片"打开图片选择器
-            upload_img_btn = modal_body.get_by_role("button", name="上传图片").first
-            await upload_img_btn.wait_for(state="visible", timeout=10000)
-            await upload_img_btn.click()
-            await page.wait_for_timeout(1500)
-
-            # 4) 设置图片到新出现的图片 file input
-            img_input = page.locator('input[type="file"][accept*="jpg"], input[type="file"][accept*="png"]').first
-            await img_input.wait_for(state="attached", timeout=10000)
+            # 3) 切到该 tab 后才出现接受图片的 file input（accept 为 ".jpg, .jpeg, .png"
+            #    且为隐藏元素，不能按 accept*=image 匹配）
+            img_input = page.locator(
+                'input[type="file"][accept*="jpg"], input[type="file"][accept*="png"]'
+            ).first
+            await img_input.wait_for(state="attached", timeout=15000)
             await img_input.set_input_files(self.thumbnail_path)
             await page.wait_for_timeout(3000)
 
-            # 5) 裁剪弹窗里点"完 成"
+            # 4) 弹窗底部点「完 成」收起
             done_btn = page.get_by_role("button", name="完 成").first
             if not await done_btn.count():
                 done_btn = page.get_by_role("button", name="完成").first
             await done_btn.wait_for(state="visible", timeout=15000)
             await done_btn.click()
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(1000)
             alipay_logger.success(_msg("🖼️", "封面已上传"))
         except Exception as exc:
             alipay_logger.warning(_msg("😵", f"封面上传失败，跳过继续: {exc}"))
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(800)
+            except Exception:
+                pass
 
     async def apply_collection(self, page: Page) -> None:
         if not self.collection_name:
@@ -414,15 +438,30 @@ class AlipayVideo(BaseVideoUploader):
             alipay_logger.warning(_msg("😵", f"选择合集失败，跳过归集继续发布: {exc}"))
 
     async def check_ai_label(self, page: Page) -> None:
-        # 作者声明是 radio 组（默认"内容无需标注"NO_STATEMENT），用 radio.check() 选中"内容由AI生成"(A_AG3)
+        # 作者声明是 radio 组（默认"内容无需标注"NO_STATEMENT），选中"内容由AI生成"(A_AG3)。
+        # radio 的 input 是 opacity:0 覆盖层，普通 check() 会因不可交互而超时，改点 label 并 force。
+        # 封面弹窗关闭后「开启AI智能优化」浮层可能再次弹出并盖住 radio，点击会落到浮层上；
+        # 因此每次点击前先关浮层，未选中就重试（实测不重试会漏选，提交报「请选择作者声明」）。
         ai_label = page.locator('label.antd5-radio-wrapper', has_text="内容由AI生成").first
         try:
-            if await ai_label.count():
-                radio = ai_label.locator('input[type="radio"]').first
-                await radio.scroll_into_view_if_needed()
-                await radio.check(timeout=5000)
-                await page.wait_for_timeout(500)
-                alipay_logger.success(_msg("🏷️", "已勾选「内容由AI生成」"))
+            if not await ai_label.count():
+                alipay_logger.warning(_msg("😵", "未找到「内容由AI生成」选项"))
+                return
+            selected = False
+            for attempt in range(3):
+                await self.dismiss_ai_optimize_popover(page)
+                await ai_label.scroll_into_view_if_needed(timeout=5000)
+                await ai_label.click(timeout=8000, force=True)
+                await page.wait_for_timeout(800)
+                if await ai_label.locator('input[type="radio"]').first.is_checked():
+                    selected = True
+                    break
+                alipay_logger.info(
+                    _msg("🔁", f"「内容由AI生成」未选中，重试（{attempt + 1}/3）")
+                )
+            if not selected:
+                raise RuntimeError("点击后 radio 仍未选中")
+            alipay_logger.success(_msg("🏷️", "已勾选「内容由AI生成」"))
         except Exception as exc:
             alipay_logger.warning(_msg("😵", f"勾选「内容由AI生成」失败: {exc}"))
 
@@ -687,10 +726,12 @@ class AlipayVideo(BaseVideoUploader):
             await self.upload_video_file(page, self.file_path)
             await self.fill_title_and_tags(page)
             await self.fill_description(page)
+            await self.dismiss_ai_optimize_popover(page)
             await self.upload_thumbnail(page)
             await self.apply_collection(page)
             await self.check_ai_label(page)
             await self.wait_for_upload_complete(page)
+            await self.dismiss_ai_optimize_popover(page)
             await self.submit_publish(page)
 
             await context.storage_state(path=self.account_file)
