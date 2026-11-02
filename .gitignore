@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Cookie 文件（敏感）
+cookies/*.json
+cookies/*.identity.json
+!cookies/.gitkeep
+
+# 日志
+logs/*.log
+!logs/.gitkeep
+
+# 结果文件
+cookies/dayu_results/*.json
+cookies/toutiao_results/*.json
+cookies/xigua_results/*.json
+
+# 临时文件
+*.tmp
+*.log
+
+# 编辑器配置
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
